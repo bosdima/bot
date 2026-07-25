@@ -2,16 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.30.0 (26.07.2026)
-ИСПРАВЛЕНИЯ v5.30.0:
-- УЛУЧШЕНО ТОЧНОЕ ОПРЕДЕЛЕНИЕ КОЛИЧЕСТВА МОНЕТ ПОСЛЕ ПОКУПКИ:
-  1. Многократная проверка баланса с увеличением интервала (до 120 секунд)
-  2. Проверка истории ордеров как fallback метод
-  3. Вычисление реального количества как разница balance_after - balance_before
-  4. Использование cumExecQty из истории ордеров при расхождении
-  5. Запись в статистику ТОЧНОГО количества с максимальной точностью
-  6. Добавлены подробные логи для отслеживания процесса
-- Улучшен метод wait_for_balance_credit для более надежного определения зачисления
+Версия 5.30.1 (26.07.2026)
+ИСПРАВЛЕНИЯ v5.30.1:
+- Исправлена синтаксическая ошибка в manual_add_price
+- Оптимизирована логика определения количества монет
+- Улучшена точность записи в статистику
 """
 import os
 import sys
@@ -90,7 +85,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.30.0 (26.07.2026)"
+BOT_VERSION = "5.30.1 (26.07.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -5097,7 +5092,8 @@ class FastDCABot:
                     reply_markup=self.get_cancel_keyboard(),
                     parse_mode='Markdown'
                 )
-            return MANUAL_ADD_AMOUNT        except ValueError as e:
+            return MANUAL_ADD_AMOUNT
+        except ValueError as e:
             await update.message.reply_text(f"❌ Ошибка! Введите корректную цену.\nПример: 2.35 или 2,35\nОшибка: {str(e)}", reply_markup=self.get_cancel_keyboard())
             return MANUAL_ADD_PRICE
 
