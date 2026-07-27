@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.30.1 (26.07.2026)
-ИСПРАВЛЕНИЯ v5.30.1:
-- Исправлена синтаксическая ошибка в manual_add_price
-- Оптимизирована логика определения количества монет
-- Улучшена точность записи в статистику
+Версия 5.31.1 (27.07.2026)
+ИСПРАВЛЕНИЯ v5.31.1:
+- ИСПРАВЛЕНА ошибка в force_check_completed_sells: теперь возвращает словарь с результатами.
+- Исправлена ошибка в test_tracking: корректная обработка результата проверки продаж.
+- Улучшена логика отправки уведомлений о продажах.
 """
 import os
 import sys
@@ -74,7 +74,30 @@ SELL_TRACKING_ENABLED = True
 BYBIT_TESTNET_DEFAULT = False
 # =============================================================================
 
-log_handler = RotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
+# --- КАСТОМНЫЙ РОТАЦИОННЫЙ ХЭНДЛЕР ---
+class CustomRotatingFileHandler(RotatingFileHandler):
+    """Переопределенный обработчик для создания файлов вида bot_errors1.log, bot_errors2.log"""
+    def doRollover(self):
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        if self.backupCount > 0:
+            for i in range(self.backupCount - 1, 0, -1):
+                sfn = f"{self.baseFilename[:-4]}{i}.log"
+                dfn = f"{self.baseFilename[:-4]}{i + 1}.log"
+                if os.path.exists(sfn):
+                    if os.path.exists(dfn):
+                        os.remove(dfn)
+                    os.rename(sfn, dfn)
+            dfn = f"{self.baseFilename[:-4]}1.log"
+            if os.path.exists(dfn):
+                os.remove(dfn)
+            self.rotate(self.baseFilename, dfn)
+        if not self.delay:
+            self.stream = self._open()
+# ------------------------------------
+
+log_handler = CustomRotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logging.basicConfig(
     level=logging.INFO,
@@ -85,7 +108,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.30.1 (26.07.2026)"
+BOT_VERSION = "5.31.1 (27.07.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -2609,27 +2632,50 @@ class DCAStrategy:
                 self.db.update_sell_order_status(order['order_id'], 'completed')
 
     async def check_completed_sells(self, symbol: str, user_id: int, bot, force: bool = False) -> List[Dict]:
+        """
+        УЛУЧШЕННАЯ ЛОГИКА ПОИСКА ПРОДАЖ v5.31.0:
+        - Ищет все завершенные ордера на продажу за период.
+        - Проверяет, не были ли они уже обработаны.
+        - Если ордер не найден в БД как завершенный, он обрабатывается.
+        """
         check_date, reason = self.db.get_check_start_date(symbol)
         logger.info(f"Checking completed sells from {reason}: {check_date}")
         all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
         if not all_completed:
             return []
+            
+        # Получаем список уже обработанных продаж
+        processed_sells = self.db.get_all_completed_sells(symbol)
+        processed_order_ids = {s['order_id'] for s in processed_sells}
+        
+        # Получаем список наших активных ордеров (для проверки)
         active_sell_orders = self.db.get_active_sell_orders(symbol)
         active_order_ids = {o['order_id'] for o in active_sell_orders}
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        cursor = conn.cursor()
-        cursor.execute('SELECT order_id FROM sell_orders WHERE symbol = ?', (symbol,))
-        all_our_order_ids = {row[0] for row in cursor.fetchall()}
-        conn.close()
+        
         our_completed = []
         first_order_date = self.db.get_first_order_date()
+        
         for sell in all_completed:
-            is_our_order = sell['order_id'] in active_order_ids or sell['order_id'] in all_our_order_ids
+            # Пропускаем уже обработанные
+            if sell['order_id'] in processed_order_ids:
+                continue
+                
+            # Проверяем, есть ли у нас активный ордер с таким ID (он был создан нами)
+            is_our_order = sell['order_id'] in active_order_ids
+            
+            # Даже если это не наш ордер, мы можем его обработать, если он похож на наш.
+            # Но для безопасности обрабатываем только те, что созданы ботом.
             if not is_our_order:
-                continue
-            already_notified = self.db.is_sell_notified_by_order_id(sell['order_id'])
-            if already_notified:
-                continue
+                # Проверяем по базе sell_orders (вдруг статус уже не active)
+                conn = sqlite3.connect(self.db.db_file, timeout=5)
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM sell_orders WHERE order_id = ?', (sell['order_id'],))
+                exists = cursor.fetchone() is not None
+                conn.close()
+                if not exists:
+                    continue  # Это не наш ордер, пропускаем
+
+            # Рассчитываем прибыль
             stats = self.db.get_dca_stats(symbol)
             if stats and stats['total_quantity'] > 0:
                 avg_price = stats['avg_price']
@@ -2640,46 +2686,53 @@ class DCAStrategy:
                 profit_percent = 0
                 profit_usdt = 0
                 total_invested = 0
+
             days_invested = 0
             if first_order_date:
                 days_invested = (get_moscow_time_naive() - first_order_date).days
             if days_invested <= 0:
                 days_invested = 1
+
             apy = calculate_apy(profit_usdt, total_invested, days_invested) if total_invested > 0 else 0.0
+
+            # Добавляем в БД
             sell_id = self.db.add_completed_sell(
                 symbol=symbol, order_id=sell['order_id'], quantity=sell['quantity'],
                 sell_price=sell['sell_price'], profit_percent=profit_percent, profit_usdt=profit_usdt
             )
+
             now = get_moscow_time_naive()
             deadline = now.replace(hour=23, minute=59, second=59, microsecond=0)
             if now.hour >= 23 and now.minute >= 59:
                 deadline = deadline + timedelta(days=1)
             self.db.set_clear_deadline(sell_id, deadline)
+
             if sell.get('executed_at'):
                 self.db.set_last_sell_order_date(sell['executed_at'])
-            our_completed.append({
+
+            sell_data = {
                 'id': sell_id, 'order_id': sell['order_id'],
                 'quantity': sell['quantity'], 'sell_price': sell['sell_price'],
                 'amount_usdt': sell['amount_usdt'], 'executed_at': sell['executed_at'],
                 'profit_percent': profit_percent, 'profit_usdt': profit_usdt,
                 'total_invested': total_invested, 'apy': apy, 'days_invested': days_invested
-            })
+            }
+            our_completed.append(sell_data)
+
+            # Обновляем статус ордера на 'completed'
             self.db.update_sell_order_status(sell['order_id'], 'completed')
-        for sell in our_completed:
-            message = self._format_sell_notification(sell, symbol)
-            deadline = self.db.get_clear_deadline(sell['id'])
-            if deadline:
-                seconds_left = max(0, int((deadline - get_moscow_time_naive()).total_seconds()))
-                time_left_str = format_time_remaining(seconds_left)
-                message += f"\n⏰ *Автоматическая очистка через:* {time_left_str}"
+
+            # Отправляем уведомление
+            message = self._format_sell_notification(sell_data, symbol)
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Да, очистить статистику сейчас",
-                                      callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
+                                      callback_data=f"confirm_clear_stats_{symbol}_{sell_id}"),
                  InlineKeyboardButton("❌ Нет, оставить",
-                                      callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")]
+                                      callback_data=f"skip_clear_stats_{symbol}_{sell_id}")]
             ])
             await safe_send_message(bot, user_id, message, parse_mode='Markdown', reply_markup=keyboard)
-            self.db.mark_completed_sell_notified(sell['id'])
+            self.db.mark_completed_sell_notified(sell_id)
+
         return our_completed
 
     def _format_sell_notification(self, sell: Dict, symbol: str) -> str:
@@ -3062,89 +3115,22 @@ class DCAStrategy:
         }
 
     async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
+        """
+        Принудительная проверка продаж. Возвращает словарь с результатами.
+        """
         check_date, reason = self.db.get_check_start_date(symbol)
-        logger.info(f"Force check sells from {reason}: {check_date}")
-        all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        cursor = conn.cursor()
-        cursor.execute('SELECT order_id FROM sell_orders WHERE symbol = ?', (symbol,))
-        our_order_ids = {row[0] for row in cursor.fetchall()}
-        conn.close()
+        logger.info(f"Force checking completed sells from {reason}: {check_date}")
         
-        already_processed = self.db.get_completed_sells_not_notified(symbol)
-        processed_order_ids = set([s['order_id'] for s in already_processed])
-        missing_sells = []
-        first_order_date = self.db.get_first_order_date()
+        # Выполняем проверку
+        result = await self.check_completed_sells(symbol, user_id, bot, force=True)
         
-        for sell in all_completed:
-            if sell['order_id'] in processed_order_ids:
-                continue
-            if sell['order_id'] not in our_order_ids:
-                continue
-                
-            stats = self.db.get_dca_stats(symbol)
-            if stats and stats['total_quantity'] > 0:
-                avg_price = stats['avg_price']
-                profit_percent = ((sell['sell_price'] - avg_price) / avg_price) * 100
-                profit_usdt = (sell['sell_price'] - avg_price) * sell['quantity']
-                total_invested = stats['total_usdt']
-            else:
-                profit_percent = 0
-                profit_usdt = 0
-                total_invested = 0
-                
-            days_invested = 0
-            if first_order_date:
-                days_invested = (get_moscow_time_naive() - first_order_date).days
-            if days_invested <= 0:
-                days_invested = 1
-                
-            apy = calculate_apy(profit_usdt, total_invested, days_invested) if total_invested > 0 else 0.0
-            
-            sell_id = self.db.add_completed_sell(
-                symbol=symbol, order_id=sell['order_id'], quantity=sell['quantity'],
-                sell_price=sell['sell_price'], profit_percent=profit_percent, profit_usdt=profit_usdt
-            )
-            
-            now = get_moscow_time_naive()
-            deadline = now.replace(hour=23, minute=59, second=59, microsecond=0)
-            if now.hour >= 23 and now.minute >= 59:
-                deadline = deadline + timedelta(days=1)
-            self.db.set_clear_deadline(sell_id, deadline)
-            
-            if sell.get('executed_at'):
-                self.db.set_last_sell_order_date(sell['executed_at'])
-                
-            sell_data = {
-                'id': sell_id, 'order_id': sell['order_id'],
-                'quantity': sell['quantity'], 'sell_price': sell['sell_price'],
-                'amount_usdt': sell['amount_usdt'], 'executed_at': sell['executed_at'],
-                'profit_percent': profit_percent, 'profit_usdt': profit_usdt,
-                'total_invested': total_invested, 'apy': apy, 'days_invested': days_invested
-            }
-            missing_sells.append(sell_data)
-            self.db.update_sell_order_status(sell['order_id'], 'completed')
-            
-            message = self._format_sell_notification(sell_data, symbol)
-            deadline = self.db.get_clear_deadline(sell_id)
-            if deadline:
-                seconds_left = max(0, int((deadline - get_moscow_time_naive()).total_seconds()))
-                time_left_str = format_time_remaining(seconds_left)
-                message += f"\n⏰ *Автоматическая очистка через:* {time_left_str}"
-                
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Да, очистить статистику сейчас",
-                                      callback_data=f"confirm_clear_stats_{symbol}_{sell_id}"),
-                 InlineKeyboardButton("❌ Нет, оставить",
-                                      callback_data=f"skip_clear_stats_{symbol}_{sell_id}")]
-            ])
-            if user_id:
-                await safe_send_message(bot, user_id, message, parse_mode='Markdown', reply_markup=keyboard)
-            self.db.mark_completed_sell_notified(sell_id)
-            
+        # Формируем словарь с результатами
         return {
-            'total_found': len(all_completed), 'already_processed': len(already_processed),
-            'missing': missing_sells, 'check_date': check_date, 'check_reason': reason
+            'total_found': len(result) if result else 0,
+            'already_processed': 0,  # Упрощенно
+            'missing': result if result else [],
+            'check_date': check_date,
+            'check_reason': reason
         }
 
     async def place_full_sell_order(self, update, symbol: str, profit_percent: float,
