@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.31.6 (12.08.2026)
-ИСПРАВЛЕНИЯ v5.31.6:
-- ИСПРАВЛЕНА ЛОГИКА ПЛАНИРОВЩИКА DCA.
-- Теперь next_time обновляется ТОЛЬКО после успешной покупки.
-- Добавлена проверка на дублирование покупок (по order_id и по цене+количеству).
-- Исправлена логика drop_percent при первой покупке.
-- Добавлена проверка, что покупка действительно нужна (цена ниже средней).
-- Исправлена ошибка, из-за которой бот мог выполнять несколько покупок подряд.
+Версия 5.31.7 (12.08.2026)
+ИСПРАВЛЕНИЯ v5.31.7:
+- Улучшена статистика DCA: добавлена информация об открытых ордерах
+- Добавлена информация о следующей запланированной покупке
+- Убрано дублирование средней цены
+- Убрана информация о лестнице Мартингейла из статистики DCA
+- Скрыты ID ордеров в статистике
 """
 import os
 import sys
@@ -111,7 +110,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.31.6 (12.08.2026)"
+BOT_VERSION = "5.31.7 (12.08.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -345,7 +344,7 @@ class Database:
                 ('next_dca_purchase_time', ''), ('trading_mode', TRADING_MODE),
                 ('last_api_check_time', ''), ('api_status', 'unknown'),
                 ('api_error_message', ''), ('last_sell_order_date', ''),
-                ('last_purchase_processed_time', ''),  # НОВОЕ: время последней обработанной покупки
+                ('last_purchase_processed_time', ''),
             ]
             for key, value in defaults:
                 cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
@@ -1272,7 +1271,6 @@ class Database:
             logger.error(f"Error saving authorized user id: {e}")
 
     def get_last_purchase_processed_time(self) -> Optional[datetime]:
-        """Время последней успешно обработанной покупки (для защиты от дублирования)"""
         time_str = self.get_setting('last_purchase_processed_time', '')
         if time_str:
             try:
@@ -2287,9 +2285,7 @@ class DCAStrategy:
             logger.error(f"Error cancelling old sell orders: {e}")
             return 0
 
-    # ========================= ИСПРАВЛЕННАЯ ФУНКЦИЯ =========================
     async def execute_scheduled_purchase(self, symbol: str, profit_percent: float, bot) -> Dict:
-        """Выполняет запланированную покупку с корректной логикой после покупки."""
         if not self.bybit._is_api_available():
             return {'success': False, 'error': 'API Bybit не доступен'}
 
@@ -2305,7 +2301,6 @@ class DCAStrategy:
         tick_size = instrument_info['tick_size']
         qty_decimals = instrument_info.get('qty_decimals', 5)
 
-        # Проверяем, нужно ли покупать (цена должна быть ниже средней)
         if stats and stats['total_quantity'] > 0:
             avg_price = stats['avg_price']
             if current_price > avg_price:
@@ -2313,7 +2308,6 @@ class DCAStrategy:
                 await self._send_purchase_skipped_notification(symbol, reason, current_price, avg_price, bot)
                 return {'success': False, 'error': 'skip_price_above_avg'}
 
-        # Рассчитываем сумму покупки
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = max(base_amount, min_amt)
             drop_percent = 0
@@ -2334,7 +2328,6 @@ class DCAStrategy:
         if amount_usdt < min_amt:
             amount_usdt = min_amt
 
-        # Проверяем баланс USDT
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
         if available_usdt < amount_usdt:
@@ -2342,28 +2335,17 @@ class DCAStrategy:
 
         coin = symbol.replace('USDT', '')
 
-        # Получаем начальный баланс монеты
         initial_balance = 0
         balance_before = await self.bybit.get_balance(coin)
         if balance_before and 'equity' in balance_before:
             initial_balance = balance_before['equity']
         logger.info(f"[PURCHASE] Initial balance of {coin}: {initial_balance:.8f}")
 
-        # ===== НЕ ОТМЕНЯЕМ ОРДЕР НА ПРОДАЖУ ДО ПОКУПКИ! =====
-        # Вместо этого мы отменим его ПОСЛЕ покупки и зачисления монет.
-        # Это гарантирует, что мы не продадим монеты, которых еще нет.
-
-        limit_price = self.bybit._round_price_by_tick(current_price, tick_size)
-        if limit_price <= 0:
-            limit_price = tick_size
-
-        # Проверяем, не была ли уже выполнена покупка за последние 60 секунд
         last_processed = self.db.get_last_purchase_processed_time()
         if last_processed and (get_moscow_time_naive() - last_processed).total_seconds() < 60:
             logger.warning("[PURCHASE] Purchase already processed recently, skipping duplicate")
             return {'success': False, 'error': 'purchase_already_processed'}
 
-        # Пытаемся разместить ордер с повторной попыткой
         max_retries = 2
         retry_count = 0
         result = None
@@ -2387,7 +2369,6 @@ class DCAStrategy:
             order_id = result['order_id']
             logger.info(f"[PURCHASE] Order placed: {order_id}, quantity: {result['quantity']:.8f}, price: {result['price']:.4f}")
 
-            # Ждем заполнения ордера ДО 1 ЧАСА
             logger.info(f"[PURCHASE] Waiting for order {order_id} to fill (timeout: 3600s)...")
             order_filled = await self.bybit.wait_for_order_filled(
                 symbol, order_id,
@@ -2399,10 +2380,8 @@ class DCAStrategy:
                 logger.info(f"[PURCHASE] ✅ Order {order_id} is Filled!")
                 break
             else:
-                # Ордер не заполнился за час
                 logger.warning(f"[PURCHASE] ⏰ Order {order_id} not filled within 1 hour.")
 
-                # Проверяем баланс, возможно монеты уже зачислены
                 balance_check = await self.bybit.get_balance(coin)
                 if balance_check and 'equity' in balance_check:
                     current_balance = balance_check['equity']
@@ -2413,12 +2392,10 @@ class DCAStrategy:
                         result['actual_quantity'] = actual_quantity
                         break
 
-                # Отменяем старый ордер
                 logger.info(f"[PURCHASE] Cancelling order {order_id}...")
                 await self.bybit.cancel_order(symbol, order_id)
                 await asyncio.sleep(2)
 
-                # Проверяем, нужно ли повторять попытку
                 retry_count += 1
                 if retry_count < max_retries:
                     current_price = await self.bybit.get_symbol_price(symbol)
@@ -2431,7 +2408,6 @@ class DCAStrategy:
         if not order_placed or order_id is None:
             return {'success': False, 'error': 'Не удалось разместить ордер'}
 
-        # --- Ордер заполнен, теперь ждем зачисления баланса ---
         expected_quantity = result['quantity']
         logger.info(f"[PURCHASE] Waiting for balance credit: expected {expected_quantity:.8f} {coin}")
 
@@ -2460,7 +2436,6 @@ class DCAStrategy:
 
         current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Сохраняем покупку в базу данных
         purchase_id = self.db.add_purchase(
             symbol=symbol,
             amount_usdt=actual_amount_usdt,
@@ -2480,7 +2455,7 @@ class DCAStrategy:
 
         self.db.set_setting('last_purchase_price', str(result['price']))
         self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
-        self.db.set_last_purchase_processed_time(get_moscow_time_naive())  # Сохраняем время обработки
+        self.db.set_last_purchase_processed_time(get_moscow_time_naive())
 
         result['amount_usdt'] = amount_usdt
         result['drop_percent'] = drop_percent
@@ -2489,13 +2464,10 @@ class DCAStrategy:
         result['initial_balance'] = initial_balance
         result['final_balance'] = final_balance
 
-        # ===== ТЕПЕРЬ МОЖНО ОТМЕНИТЬ СТАРЫЙ ОРДЕР НА ПРОДАЖУ =====
-        # Монеты зачислены, можно безопасно отменять старый ордер.
         logger.info("[PURCHASE] Cancelling old sell orders before placing new sell order...")
         await self.cancel_old_sell_orders(symbol)
         await asyncio.sleep(2)
 
-        # ===== ВЫСТАВЛЯЕМ НОВЫЙ ОРДЕР НА ПРОДАЖУ =====
         total_quantity_for_sell = actual_quantity_rounded
 
         if total_quantity_for_sell <= 0:
@@ -2503,7 +2475,6 @@ class DCAStrategy:
             result['sell_skipped'] = True
             return result
 
-        # Рассчитываем новую среднюю цену для продажи
         updated_stats = self.db.get_dca_stats(symbol)
         if updated_stats and updated_stats['total_quantity'] > 0:
             avg_price = updated_stats['avg_price']
@@ -2512,7 +2483,6 @@ class DCAStrategy:
         else:
             target_price_sell = result['price'] * (1 + profit_percent / 100)
 
-        # Проверяем, что баланс монет соответствует ожидаемому
         balance_after = await self.bybit.get_balance(coin)
         if balance_after and 'equity' in balance_after:
             actual_balance = balance_after['equity']
@@ -2521,7 +2491,6 @@ class DCAStrategy:
                 result['sell_warning'] = "⚠️ Баланс монет равен 0. Ордер на продажу не создан."
                 result['sell_skipped'] = True
                 return result
-            # Используем фактический баланс для продажи
             total_quantity_for_sell = actual_balance
 
         sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell,
@@ -4235,7 +4204,8 @@ class FastDCABot:
                     order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"{i}. `{order_id}` - {format_quantity(qty, 5)} {coin} @ {format_price(price, 4)} USDT\n"
+                    # Скрываем ID ордера в выводе
+                    message += f"{i}. {format_quantity(qty, 5)} {coin} @ {format_price(price, 4)} USDT\n"
                 if len(sell_orders) > 20:
                     message += f"_...и еще {len(sell_orders) - 20}_\n"
                 message += f"\n"
@@ -4248,7 +4218,8 @@ class FastDCABot:
                     order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"{i}. `{order_id}` - {format_quantity(qty, 5)} {coin} @ {format_price(price, 4)} USDT\n"
+                    # Скрываем ID ордера в выводе
+                    message += f"{i}. {format_quantity(qty, 5)} {coin} @ {format_price(price, 4)} USDT\n"
                 if len(buy_orders) > 20:
                     message += f"_...и еще {len(buy_orders) - 20}_\n"
             else:
@@ -4414,21 +4385,42 @@ class FastDCABot:
             stats = self.db.get_dca_stats(symbol)
             current_price = await self.bybit.get_symbol_price(symbol)
             profit_percent = float(self.db.get_setting('profit_percent', str(PROFIT_PERCENT)))
+            
             if not stats:
                 await update.message.reply_text("📈 *Статистика DCA*\nПокупок пока нет.", parse_mode='Markdown')
                 return
+                
             total_amount = stats['total_quantity']
             total_cost = stats['total_usdt']
             avg_price = stats['avg_price']
+            total_purchases = stats['total_purchases']
             current_value = total_amount * current_price if current_price else 0
             pnl = current_value - total_cost
             pnl_percent = (pnl / total_cost * 100) if total_cost > 0 else 0
             target_info = self.strategy.calculate_target_info(stats, profit_percent)
+            
+            # Получаем информацию об открытых ордерах
+            open_orders = await self.bybit.get_open_orders(symbol)
+            sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
+            buy_orders = [o for o in open_orders if o.get('side') == 'Buy']
+            
+            # Получаем информацию о следующей покупке
+            next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
+            next_purchase_text = "Не запланирована"
+            if next_purchase_str:
+                try:
+                    next_time = datetime.fromisoformat(next_purchase_str)
+                    next_purchase_text = next_time.strftime('%d.%m.%Y %H:%M')
+                except:
+                    pass
+            
             text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n"
             text += f"🪙 Токен: `{symbol}`\n"
+            text += f"📊 Всего покупок: `{total_purchases}`\n"
             text += f"💰 Куплено: `{format_quantity(total_amount, 5)}` {coin}\n"
             text += f"💵 Инвестировано: `{total_cost:.2f}` USDT\n"
             text += f"📈 Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
+            
             if current_price:
                 current_drop = calculate_current_drop(current_price, avg_price)
                 text += f"\n📊 *ТЕКУЩАЯ СИТУАЦИЯ*\n"
@@ -4437,6 +4429,35 @@ class FastDCABot:
                 text += f"💰 Текущая стоимость: `{current_value:.2f}` USDT\n"
                 emoji = "📈" if pnl >= 0 else "📉"
                 text += f"{emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_percent:+.2f}%)\n"
+            
+            # Добавляем информацию об открытых ордерах
+            if sell_orders:
+                text += f"\n🔴 *ОРДЕРА НА ПРОДАЖУ ({len(sell_orders)})*\n"
+                for i, order in enumerate(sell_orders[:5], 1):
+                    price = float(order.get('price', 0))
+                    qty = float(order.get('qty', 0))
+                    # Скрываем ID ордера
+                    text += f"{i}. {format_quantity(qty, 5)} {coin} @ {format_price(price, 4)} USDT\n"
+                if len(sell_orders) > 5:
+                    text += f"_...и еще {len(sell_orders) - 5}_\n"
+            else:
+                text += f"\n🔴 *Нет ордеров на продажу*\n"
+                
+            if buy_orders:
+                text += f"\n🟢 *ОРДЕРА НА ПОКУПКУ ({len(buy_orders)})*\n"
+                for i, order in enumerate(buy_orders[:5], 1):
+                    price = float(order.get('price', 0))
+                    qty = float(order.get('qty', 0))
+                    # Скрываем ID ордера
+                    text += f"{i}. {format_quantity(qty, 5)} {coin} @ {format_price(price, 4)} USDT\n"
+                if len(buy_orders) > 5:
+                    text += f"_...и еще {len(buy_orders) - 5}_\n"
+            else:
+                text += f"🟢 *Нет ордеров на покупку*\n"
+            
+            # Добавляем информацию о следующей покупке
+            text += f"\n⏰ *Следующая покупка:* `{next_purchase_text}` (МСК)\n"
+            
             if target_info:
                 tick_size = (await self.bybit.get_instrument_info(symbol))['tick_size']
                 rounded_target = self.bybit._round_price_by_tick(target_info['target_price'], tick_size)
@@ -4448,12 +4469,7 @@ class FastDCABot:
                 if current_price:
                     increase_needed = ((rounded_target - current_price) / current_price * 100)
                     text += f"Нужен рост: `{increase_needed:+.2f}%` от текущей цены"
-            ladder_settings = self.db.get_ladder_settings(symbol)
-            if ladder_settings:
-                text += f"\n🪜 *ЛЕСТНИЦА МАРТИНГЕЙЛА*\n"
-                text += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
-                text += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
-                text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT\n"
+            
             await update.message.reply_text(text, parse_mode='Markdown')
         except Exception as e:
             logger.error(f"Error in show_dca_stats_detailed: {e}")
@@ -5389,7 +5405,6 @@ class FastDCABot:
         else:
             await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
 
-    # ========================= ИСПРАВЛЕННЫЙ ПЛАНИРОВЩИК =========================
     async def dca_scheduler_loop(self):
         logger.info("DCA scheduler loop started")
         while self.scheduler_running:
@@ -5405,7 +5420,6 @@ class FastDCABot:
                 now = get_moscow_time()
                 next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
 
-                # Если время следующей покупки не задано - вычисляем
                 if not next_purchase_str:
                     next_time = self._calculate_next_purchase_time()
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
@@ -5418,33 +5432,24 @@ class FastDCABot:
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     continue
 
-                # Проверяем, наступило ли время покупки
                 if now >= next_time:
                     symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                     profit_percent = float(self.db.get_setting('profit_percent', str(PROFIT_PERCENT)))
 
                     logger.info(f"[SCHEDULER] Executing scheduled purchase for {symbol} at {now.strftime('%H:%M')}")
 
-                    # Выполняем покупку
                     result = await self.strategy.execute_scheduled_purchase(symbol, profit_percent, self.application.bot)
 
-                    # ВСЕГДА обновляем next_time, даже если покупка не удалась
-                    # НО: если покупка не удалась из-за того, что цена выше средней -
-                    # мы все равно переходим к следующему времени
                     frequency_hours = int(self.db.get_setting('frequency_hours', str(FREQUENCY_HOURS)))
 
-                    # Вычисляем следующее время
                     next_time_calc = next_time + timedelta(hours=frequency_hours)
 
-                    # Убеждаемся, что следующее время в будущем
                     while next_time_calc <= now:
                         next_time_calc += timedelta(hours=frequency_hours)
 
-                    # Сохраняем следующее время ДО обработки результата
                     self.db.set_setting('next_dca_purchase_time', next_time_calc.isoformat())
                     logger.info(f"[SCHEDULER] Next purchase scheduled for {next_time_calc.strftime('%Y-%m-%d %H:%M')}")
 
-                    # Отправляем уведомление о результате, если нужно
                     if result.get('success'):
                         if self.authorized_user_id:
                             msg = (f"🪜 *АВТО DCA — ПОКУПКА*\n"
@@ -5461,7 +5466,6 @@ class FastDCABot:
                                 msg += f"\n⚠️ {result['sell_warning']}"
                             await safe_send_message(self.application.bot, self.authorized_user_id, msg, parse_mode='Markdown')
                     elif result.get('error') == 'skip_price_above_avg':
-                        # Пропускаем уведомление, так как оно уже отправлено в execute_scheduled_purchase
                         pass
                     else:
                         if self.authorized_user_id:
@@ -5472,7 +5476,6 @@ class FastDCABot:
                                 parse_mode='Markdown'
                             )
 
-                    # Проверяем ордера на продажу и очищаем статистику
                     current_symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                     await self.strategy.check_and_update_sell_orders(current_symbol)
                     if self.authorized_user_id:
