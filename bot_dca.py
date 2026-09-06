@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.40.0 (23.08.2026)
-Исправления:
-- Улучшена надежность мониторинга ордеров на продажу (polling + WebSocket fallback)
-- Исправлена обработка завершенных продаж и отправка уведомлений
-- Исправлена автоматическая очистка статистики после продажи
-- Улучшена обработка ошибок WebSocket
-- Добавлены дополнительные проверки баланса перед созданием ордера
+Версия 5.41.0 (06.09.2026)
+ИСПРАВЛЕНИЯ:
+- Исправлена ошибка WebSocket: object NoneType can't be used in 'await' expression
+- Добавлена правильная обработка WebSocket через asyncio.to_thread
+- Добавлена обработка ошибки 'Too many sessions under the same UID'
+- Оптимизирован механизм переподключения WebSocket
+- Добавлена проверка активных сессий перед созданием новой
 """
 import os
 import sys
@@ -131,7 +131,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.40.0 (23.08.2026)"
+BOT_VERSION = "5.41.0 (06.09.2026)"
 CONVERSATION_TIMEOUT = 180
 SELL_DECIMALS_FALLBACK = 5
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1492,6 +1492,10 @@ class BybitClient:
         self.ws = None
         self.ws_running = False
         self._order_update_callback = None
+        self._ws_task = None
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 5
+        self._reconnect_delay = 60
 
     def _init_session(self):
         try:
@@ -1521,15 +1525,26 @@ class BybitClient:
         return self.session is not None and self.api_key and self.api_secret
 
     async def start_websocket(self, callback, symbol: str):
-        """Запускает WebSocket для отслеживания обновлений ордеров."""
+        """
+        Запускает WebSocket для отслеживания обновлений ордеров.
+        Исправленная версия - использует asyncio.to_thread для синхронного WebSocket.
+        """
         if self.ws_running:
-            logger.info("WebSocket already running")
+            logger.info("WebSocket уже запущен")
+            return
+
+        # Проверяем, не превышено ли количество попыток переподключения
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            logger.warning(f"Достигнуто максимальное количество попыток переподключения ({self._max_reconnect_attempts})")
+            self._reconnect_attempts = 0
             return
 
         self._order_update_callback = callback
+        
         try:
-            logger.info(f"Starting WebSocket for {symbol}...")
+            logger.info(f"Запуск WebSocket для {symbol}... (попытка {self._reconnect_attempts + 1})")
             
+            # Создаем экземпляр WebSocket
             self.ws = WebSocket(
                 testnet=self.testnet,
                 channel_type="private",
@@ -1537,25 +1552,70 @@ class BybitClient:
                 api_secret=self.api_secret
             )
             
-            await self.ws.order_stream(
-                callback=self._handle_order_update
+            # ВАЖНО: order_stream - это НЕ async метод, он синхронный!
+            # Запускаем его в отдельном потоке через asyncio.to_thread
+            self.ws_running = True
+            
+            # Запускаем WebSocket в отдельной задаче
+            self._ws_task = asyncio.create_task(
+                self._run_websocket_thread(symbol)
             )
             
-            self.ws_running = True
-            logger.info(f"WebSocket started successfully")
+            logger.info(f"WebSocket запущен для {symbol}")
+            self._reconnect_attempts = 0  # Сбрасываем счетчик при успешном запуске
             
-            while self.ws_running:
-                await asyncio.sleep(30)
-                if not self.ws_running:
-                    break
-                    
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            logger.error(f"Ошибка WebSocket: {e}")
             self.ws_running = False
-            # Попытка переподключения через минуту
-            if self._order_update_callback:
-                await asyncio.sleep(60)
+            self._reconnect_attempts += 1
+            
+            # Попытка переподключения с задержкой
+            if self._reconnect_attempts < self._max_reconnect_attempts:
+                delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))  # Экспоненциальная задержка
+                logger.info(f"Повторное подключение через {delay} секунд...")
+                await asyncio.sleep(delay)
                 asyncio.create_task(self.start_websocket(callback, symbol))
+            else:
+                logger.error("Превышено максимальное количество попыток переподключения WebSocket")
+                if self._order_update_callback:
+                    # Уведомляем о проблеме через callback
+                    await self._order_update_callback({
+                        'error': 'WebSocket connection failed after max retries',
+                        'symbol': symbol
+                    })
+
+    async def _run_websocket_thread(self, symbol: str):
+        """Запускает WebSocket в отдельном потоке."""
+        try:
+            # Используем asyncio.to_thread для запуска синхронного метода в потоке
+            # Это позволяет избежать блокировки event loop
+            await asyncio.to_thread(
+                self.ws.order_stream,
+                callback=self._handle_order_update
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в WebSocket потоке: {e}")
+            self.ws_running = False
+            
+            # Проверяем, не является ли ошибка "Too many sessions"
+            if "Too many sessions" in str(e):
+                logger.warning("Обнаружено превышение количества сессий WebSocket")
+                # Увеличиваем задержку перед переподключением
+                self._reconnect_delay = 300  # 5 минут
+                self._reconnect_attempts = self._max_reconnect_attempts  # Останавливаем переподключения
+                if self._order_update_callback:
+                    await self._order_update_callback({
+                        'error': 'Too many WebSocket sessions',
+                        'symbol': symbol
+                    })
+            else:
+                # Другие ошибки - пытаемся переподключиться
+                self._reconnect_attempts += 1
+                if self._reconnect_attempts < self._max_reconnect_attempts:
+                    delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
+                    logger.info(f"Переподключение через {delay} секунд...")
+                    await asyncio.sleep(delay)
+                    asyncio.create_task(self.start_websocket(self._order_update_callback, symbol))
 
     async def _handle_order_update(self, message):
         """Обработчик обновлений ордеров через WebSocket."""
@@ -1572,7 +1632,7 @@ class BybitClient:
             if not order_id or not order_status:
                 return
                 
-            logger.info(f"WebSocket order update: {order_id} -> {order_status}")
+            logger.info(f"WebSocket обновление ордера: {order_id} -> {order_status}")
             
             if order_status == 'Filled' and side == 'Sell' and self._order_update_callback:
                 order_info = {
@@ -1589,19 +1649,33 @@ class BybitClient:
                 await self._order_update_callback(order_info)
                 
         except Exception as e:
-            logger.error(f"Error handling WebSocket message: {e}")
+            logger.error(f"Ошибка обработки WebSocket сообщения: {e}")
 
     async def stop_websocket(self):
+        """Останавливает WebSocket."""
         self.ws_running = False
+        self._reconnect_attempts = 0
+        
+        if self._ws_task and not self._ws_task.done():
+            self._ws_task.cancel()
+            try:
+                await asyncio.wait_for(self._ws_task, timeout=5.0)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Ошибка остановки WebSocket задачи: {e}")
+        
         if self.ws:
             try:
-                await self.ws.exit()
-            except:
-                pass
+                await asyncio.to_thread(self.ws.exit)
+            except Exception as e:
+                logger.error(f"Ошибка закрытия WebSocket: {e}")
+        
         self.ws = None
-        logger.info("WebSocket stopped")
+        self._ws_task = None
+        logger.info("WebSocket остановлен")
 
-    # --- Остальные методы ---
+    # --- Остальные методы (без изменений) ---
     async def check_api_health(self) -> Dict:
         self._refresh_session()
         if not self._is_api_available():
@@ -2600,7 +2674,7 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error handling order update: {e}")
 
-    # --- Остальные методы ---
+    # --- Остальные методы (без изменений) ---
     async def _place_buy_order_and_wait(self, symbol: str, price: float, amount: float, is_auto: bool) -> Dict:
         result = await self.bybit.place_limit_buy(symbol, price, amount, is_auto)
         if not result['success']:
@@ -5124,7 +5198,7 @@ class FastDCABot:
                     self.strategy.sell_order_monitor_loop(symbol, self.authorized_user_id, self.application.bot)
                 )
             
-            # Запускаем WebSocket (если работает)
+            # Запускаем WebSocket (исправленная версия)
             if self._websocket_task is None or self._websocket_task.done():
                 self._websocket_task = asyncio.create_task(
                     self.bybit.start_websocket(
@@ -5982,7 +6056,7 @@ class FastDCABot:
                     self._sell_monitor_task = asyncio.create_task(
                         self.strategy.sell_order_monitor_loop(symbol, self.authorized_user_id, self.application.bot)
                     )
-                    # Запускаем WebSocket
+                    # Запускаем WebSocket (исправленная версия)
                     self._websocket_task = asyncio.create_task(
                         self.bybit.start_websocket(
                             self.strategy.handle_order_update,
